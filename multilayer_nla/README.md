@@ -21,6 +21,7 @@ repo's `EXPERIMENT_REPORT.md` / `SWEEP_STATUS.md` / `docs/layer_combos_explained
 | `verify_center_parity.py` | multi-hook center tap == legacy single-layer extraction (bitwise) | GPU |
 | `verify_regen_parity.py` | final-token gather == legacy final token on published prefixes (bitwise) | GPU |
 | `build_from_published.py` | bank → av/ar/rl training parquets for a chosen `--center` (re-slice, no re-extraction) | CPU |
+| `split_parquet.py` | doc-level train/val materialization of a built parquet (+ manifest) | CPU |
 | `splits.py` | doc-level train/dev/test manifests (+ locked eval subsets) | CPU |
 | `train_ar_multi.py` | multi-tap AR (truncated backbone + per-depth heads) SFT warm-start | GPU |
 | `train_av_multi.py` | k-slot AV (multi-marker Karvonen injection) SFT warm-start | GPU |
@@ -63,17 +64,41 @@ and same-count retokenization drift in one shot — the strongest guard, and it
 costs nothing); short-window drop (≈0 rows given stage-0's `_MIN_POSITION=50`);
 float16 range checks before every fp16 cast.
 
-**Storage math** (Qwen3-8B, d=4096; `--dry-run` prints exact numbers):
+**Storage math** (Qwen3-8B, d=4096; `--dry-run` prints exact numbers). The
+ceselder set is ~1M rows total (av ~250k / ar ~250k / rl ~500k):
 
-| columns | per row |
-|---|---:|
-| `activation_L19..29` fp32 (11 layers) | 176 KB |
-| `activation_L19..29` fp16 | 88 KB |
-| `window_L{23,24,25}` W=8 fp16 | 197 KB |
-| `activation_L23..25` fp32 only (minimal) | 48 KB |
+| columns | per row | full ceselder run |
+|---|---:|---:|
+| `activation_L19..29` fp32 (11 layers) | 176 KB | ~176 GB (all 1M rows — matches the old bank) |
+| `activation_L19..29` fp16 | 88 KB | ~88 GB |
+| `window_L{23,24,25}` W=8 fp16 | 197 KB | ~148 GB (av+rl rows only) |
+| `activation_L23..25` fp32 only (minimal) | 48 KB | ~48 GB |
 
 The AR only ever reads final-token targets → **`--window 0` on `ar_sft`**.
-Windows go on the AV-side subsets (`av_sft`, `rl`).
+Windows go on the AV-side subsets (`av_sft`, `rl`). If disk is tight: windows
+on `av_sft` only, or a `--max-rows 40000` window pilot (the pre-registered
+multitoken pilot size) alongside a window-free full archive.
+
+## Data source (decided 2026-07-08): the ceselder lineage
+
+The rerun uses **`ceselder/qwen3-8b-nla-L24-finefineweb-100k`** — the same
+labels the §7/§8 sweeps and the existing `senku21x/qwen3-8b-nla-multilayer-L19-29`
+bank were built from, so all previous numbers stay comparable (AR-gold ceiling
+≈ 0.67 under the converged recipe is the sanity anchor a fresh AR retrain
+should land near).
+
+Consequence: ceselder rows carry **no stored `activation_vector`**, so the
+in-run stored-vector parity guard skips (it prints a NOTE). The compensating
+gates are MANDATORY, not optional: `verify_regen_parity` (bitwise, on real
+published rows) and `verify_bank --existing` against a shard of the OLD
+L19-29 bank (joined on `doc_id` + `n_raw_tokens` — an off-position or
+wrong-layer rerun collapses the median cosine).
+
+The tooling also accepts `asher577/easynla-warmstart-data` (EasyNLA's own
+warmstart; stored vectors present → the parity guard arms automatically, and
+`_train`/`_val` files are discovered as-is) — but it is a DIFFERENT lineage
+(newer Sonnet 4.6 labels, 371k rows): never mix the two in one experiment, and
+re-establish baselines before comparing anything across them.
 
 ## Runbook (vast box)
 
@@ -82,43 +107,60 @@ git clone https://github.com/senku14x/EasyNLA && cd EasyNLA && git checkout mult
 python -m venv .venv && source .venv/bin/activate && pip install -e . && pip install bitsandbytes
 export HF_HOME=/data/hf  # big disk
 
-# 0. download the published warmstart data (labels + stored L24 vectors + prefixes)
-huggingface-cli download asher577/easynla-warmstart-data --repo-type dataset --local-dir /data/pub
-# echo the schema BEFORE anything else — expect detokenized_text_truncated,
-# n_raw_tokens, activation_vector, activation_layer, doc_id, prompt[, response]:
+# 0. download the published labeled subsets (text + labels, no vectors)
+PUB=/data/pub
+python - <<'PY'
+import os
+from datasets import load_dataset
+os.makedirs("/data/pub", exist_ok=True)
+for name in ("av_sft", "ar_sft", "rl"):
+    ds = load_dataset("ceselder/qwen3-8b-nla-L24-finefineweb-100k", name, split="train")
+    ds.to_parquet(f"/data/pub/{name}.parquet"); print(name, ds.num_rows)
+PY
+# schema echo BEFORE anything else — expect detokenized_text_truncated,
+# n_raw_tokens, doc_id, prompt[, response]; NO activation_vector:
 python - <<'PY'
 import pyarrow.parquet as pq, glob
 for f in sorted(glob.glob("/data/pub/*.parquet")):
-    print(f, pq.ParquetFile(f).schema_arrow.names, pq.ParquetFile(f).metadata.num_rows)
+    print(f, pq.ParquetFile(f).metadata.num_rows, pq.ParquetFile(f).schema_arrow.names)
 PY
+# reference for cross-parity: ONE shard of the old L19-29 bank
+huggingface-cli download senku21x/qwen3-8b-nla-multilayer-L19-29 --repo-type dataset \
+    --include "*av_sft*shard00*" --local-dir /data/oldbank   # adjust pattern to the repo layout
 
 # 1. storage estimate first (no GPU) — then the real runs
 BANK=/data/mlnla/bank
-python -m multilayer_nla.regenerate_bank --in /data/pub/av_sft_train.parquet --out $BANK/av_sft_train.parquet \
+python -m multilayer_nla.regenerate_bank --in $PUB/av_sft.parquet --out $BANK/av_sft.parquet \
     --base-model Qwen/Qwen3-8B --save-layers 19-29 --window 8 --window-layers 23,24,25 --dry-run
 
-for s in av_sft_train av_sft_val rl_train rl_val; do        # AV-side: windows ON
-  python -m multilayer_nla.regenerate_bank --in /data/pub/$s.parquet --out $BANK/$s.parquet \
+for s in av_sft rl; do                                      # AV-side: windows ON
+  python -m multilayer_nla.regenerate_bank --in $PUB/$s.parquet --out $BANK/$s.parquet \
       --base-model Qwen/Qwen3-8B --save-layers 19-29 --window 8 --window-layers 23,24,25 \
       --max-length 4096 --batch-size 16 --length-bucket --max-drop-frac 1e-3
 done
-for s in ar_sft_train ar_sft_val; do                        # AR-side: final-token only
-  python -m multilayer_nla.regenerate_bank --in /data/pub/$s.parquet --out $BANK/$s.parquet \
-      --base-model Qwen/Qwen3-8B --save-layers 19-29 --window 0 \
-      --max-length 4096 --batch-size 16 --length-bucket --max-drop-frac 1e-3
-done
-# (adjust the subset list to whatever step 0 printed; multi-GPU: add
-#  --num-shards N --shard-index i per job — the tool prints the merge one-liner)
+python -m multilayer_nla.regenerate_bank --in $PUB/ar_sft.parquet --out $BANK/ar_sft.parquet \
+    --base-model Qwen/Qwen3-8B --save-layers 19-29 --window 0 \
+    --max-length 4096 --batch-size 16 --length-bucket --max-drop-frac 1e-3
+# multi-GPU: add --num-shards N --shard-index i per job (the tool prints the
+# merge one-liner). Pilot first: --max-rows 2000 on av_sft, then verify, then full.
 
-# 2. integrity gates (cheap; run them EVERY time)
-python -m multilayer_nla.verify_bank --bank $BANK/av_sft_train.parquet
+# 2. integrity gates (cheap; MANDATORY on this lineage — no stored vectors in-run)
 python -m multilayer_nla.verify_regen_parity --base-model Qwen/Qwen3-8B \
-    --parquet /data/pub/av_sft_train.parquet --center-layer 24 --n-rows 64 --max-length 4096
+    --parquet $PUB/av_sft.parquet --center-layer 24 --n-rows 64 --max-length 4096
+python -m multilayer_nla.verify_bank --bank $BANK/av_sft.parquet \
+    --existing /data/oldbank/<shard>.parquet          # old bank = known-good reference
+python -m multilayer_nla.verify_bank --bank $BANK/ar_sft.parquet
+python -m multilayer_nla.verify_bank --bank $BANK/rl.parquet
 
 # 3. bank → training parquets for center 24 (re-run with a different --center
-#    to sweep centers WITHOUT re-extracting)
+#    to sweep centers WITHOUT re-extracting), then doc-level train/val split
 TRAIN=/data/mlnla/train_c24
 python -m multilayer_nla.build_from_published --mode all --center 24 --in-dir $BANK --out-dir $TRAIN
+for s in av_sft ar_sft rl; do
+  python -m multilayer_nla.split_parquet --in $TRAIN/$s.parquet --out-dir $TRAIN \
+      --prefix $s --fracs 0.9,0.1 --names train,val --seed 42
+done
+# (same seed ⇒ same doc buckets on any future --center rebuild — eval docs stay fixed)
 
 # 4. warm-start: shared multi-tap AR first, then the AV
 python -m multilayer_nla.train_ar_multi --base-ckpt Qwen/Qwen3-8B \
@@ -135,6 +177,8 @@ python -m multilayer_nla.train_av_multi --base-ckpt Qwen/Qwen3-8B \
 python -m multilayer_nla.eval_ar_gold --base-ckpt Qwen/Qwen3-8B \
     --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 --eval-parquet $TRAIN/ar_sft_val.parquet \
     --summary /data/eval/ar_gold_val.json
+#   sanity anchor: the §8 converged recipe put AR-gold ≈ 0.67 on this lineage —
+#   a big deviation means recipe drift, investigate before training the AV further.
 python -m multilayer_nla.evaluate_e2e --base-ckpt Qwen/Qwen3-8B \
     --av-ckpt /data/ckpt/av_local/iter_0001000 --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 \
     --eval-parquet $TRAIN/rl_val.parquet --condition local \
