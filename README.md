@@ -165,11 +165,24 @@ nla/
   train_rl_self_contained.py         # single-GPU GRPO RL
   datagen/                           # activation extraction + gold-explanation pipeline
   utils/                             # hooks, prompts, critic, logging, steering, config layer
+multilayer_nla/                      # multi-layer × multi-position NLA experiment package
+                                     #   (unified bank regeneration, k-slot AV, multi-tap AR,
+                                     #    held-out e2e eval — see multilayer_nla/README.md)
 configs/                             # tuned run configs (rl_vllm, rl_sgpu, datagen/*)
 docs/                                # train_new_model.md, vllm-lens-setup.md
 scripts/                             # merge_lora_to_hf, compute_fve_baseline, show_nla_generations, install_vllm_lens
 utils/patch_vllm_lens.py            # required patch for the vLLM rollout path
 ```
+
+## Multi-layer / multi-position NLAs
+
+The **`multilayer_nla/`** package trains NLAs whose verbalizer reads k
+activation slots (multiple layers today; position windows banked for the next
+experiment) and whose reconstructor predicts a fixed multi-layer target.
+`regenerate_bank.py` rebuilds activations for the published warmstart labels in
+ONE GPU pass — final-token vectors for a wide layer band plus per-position
+windows — with round-trip and stored-vector parity guards. Full runbook:
+[`multilayer_nla/README.md`](multilayer_nla/README.md).
 
 ## License
 
