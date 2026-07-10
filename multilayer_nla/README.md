@@ -216,23 +216,27 @@ python -m multilayer_nla.train_ar_multi --base-ckpt Qwen/Qwen3-8B \
     --parquet $COND/ar_common.parquet --eval-parquet $COND/ar_dev.parquet \
     --save-dir /data/ckpt/ar_3tap --tap-layers 23,24,25 --use-lora --quant none \
     --num-steps 3000 --batch-size 64 --gradient-accumulation-steps 4 --lr 1e-4
-for c in single dup3 lay3 tok3 mix4 dup4; do
+CONDS="single dup3 lay3 tok3 mix4 dup4 tok5 tok5w dup5"
+for c in $CONDS; do
   python -m multilayer_nla.train_av_multi --base-ckpt Qwen/Qwen3-8B \
       --parquet $COND/av_$c.parquet --save-dir /data/ckpt/av_$c --use-lora --quant none \
       --num-steps 1000 --batch-size 64 --wandb-name av_$c
 done
 
-# 3. eval: dev for selection, test ONCE; shufctx evaluated with tok3's AV
-for c in single dup3 lay3 tok3 mix4 dup4; do
+# 3. eval: dev for selection, test ONCE; each shufctx arm evaluated with its
+#    PARENT condition's AV (tok3_shufctx <- av_tok3, tok5_shufctx <- av_tok5, ...)
+for c in $CONDS; do
   python -m multilayer_nla.evaluate_e2e --base-ckpt Qwen/Qwen3-8B \
       --av-ckpt /data/ckpt/av_$c/iter_0001000 --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 \
       --eval-parquet $COND/rl_test_$c.parquet --condition $c \
       --out /data/eval/test_$c.jsonl --summary /data/eval/test_$c.json
 done
-python -m multilayer_nla.evaluate_e2e --base-ckpt Qwen/Qwen3-8B \
-    --av-ckpt /data/ckpt/av_tok3/iter_0001000 --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 \
-    --eval-parquet $COND/rl_test_tok3_shufctx.parquet --condition tok3_shufctx \
-    --out /data/eval/test_tok3_shufctx.jsonl --summary /data/eval/test_tok3_shufctx.json
+for c in tok3 tok5 tok5w; do
+  python -m multilayer_nla.evaluate_e2e --base-ckpt Qwen/Qwen3-8B \
+      --av-ckpt /data/ckpt/av_$c/iter_0001000 --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 \
+      --eval-parquet $COND/rl_test_${c}_shufctx.parquet --condition ${c}_shufctx \
+      --out /data/eval/test_${c}_shufctx.jsonl --summary /data/eval/test_${c}_shufctx.json
+done
 
 # 4. optional warmstart improvement round (see below), then re-train + re-eval
 python -m multilayer_nla.distill_av --mode score-gold --in $COND/av_lay3.parquet \
@@ -287,7 +291,10 @@ already summarize their context (the progressive-reader-style null), giving
 | `tok3` | L24@-2, L24@-1, L24@0 | **position diversity (k=3)** |
 | `mix4` | L23@-1, L23@0, L25@-1, L25@0 | positions × layers interaction (k=4) |
 | `dup4` | L24@0 ×4 | marker-count control at k=4 |
-| `tok3_shufctx` | tok3 \| shufctx | eval-only: context slots from another doc, final true |
+| `tok5` | L24@-4 … L24@0 | contiguous 5-position window (k=5) |
+| `tok5w` | L24@{-7,-4,-2,-1,0} | **log-spaced 5 positions, full W=8 reach** (k=5) |
+| `dup5` | L24@0 ×5 | marker-count control at k=5 |
+| `tok{3,5,5w}_shufctx` | parent \| shufctx | eval-only: context slots from another doc, final true |
 
 Every condition reconstructs the SAME fixed target (default [L23,L24,L25]@p);
 same-k conditions share ONE neutral prompt (identical text — only the vectors
@@ -297,6 +304,13 @@ differ); dev selects checkpoints, test is touched once. Decision rules
   used as this-document context (proceed to wider windows / RL on the winner).
 - `tok3 ≈ dup3 ≈ single` ⇒ the multitoken null: late positions are collinear
   for this channel — report it and stop investing in position slots.
+- **Dose-response**: `single → tok3 → tok5` each vs its dup control — a rising
+  paired-Δ curve says window width keeps paying; flat says it saturates by k=3.
+- **Adjacency vs span at k=5**: `tok5w − tok5` CI excludes 0 ⇒ decorrelated
+  (log-spaced) positions beat contiguous ones — the position-space analog of
+  §7's stride-2 layer result. A `tok5w` win motivates re-banking with
+  `--window 16/32` for longer reach (offsets beyond p-7 need a wider bank;
+  everything here builds from the existing W=8 bank on CPU).
 - `lay3 − dup3` should reproduce §7's +1.6pp under the neutral template
   (a recipe sanity anchor, not a new claim).
 

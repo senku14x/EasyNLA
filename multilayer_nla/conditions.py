@@ -153,10 +153,18 @@ LEGACY_SWEEP = {
     "s2_20_22_24": "s2_20_22_24=L20@0,L22@0,L24@0",
 }
 
-# The pre-registered position-vs-layer permutation grid (matched k=3 everywhere;
-# dup3 is the shared marker-count control; shufctx arms are eval-only):
-#   lay3 vs tok3 is the head-to-head — layer diversity vs position diversity at
-#   fixed slot count, same fixed target, same prompt.
+# The pre-registered position-vs-layer permutation grid. Structure:
+#   * matched-k comparisons only (dup{k} is each k's marker-count control);
+#   * lay3 vs tok3 — layer diversity vs position diversity at k=3;
+#   * single -> tok3 -> tok5 (+ their dup controls) — dose-response over
+#     window width;
+#   * tok5 (contiguous, reach p-4) vs tok5w (log-spaced, reach p-7 == the full
+#     W=8 bank window) — adjacency vs span at k=5. Position-space analog of
+#     §7's stride-2 result (spread layers beat adjacent ones at matched k);
+#     adjacent positions are maximally collinear, so log-spacing (dense near p,
+#     sparse far back — matching how context is progressively summarized)
+#     should buy more non-redundant information per slot;
+#   * shufctx arms are EVAL-ONLY controls for the position conditions.
 PERMUTATION_GRID = (
     "single=L24@0; "
     "dup3=L24@0,L24@0,L24@0; "
@@ -164,5 +172,10 @@ PERMUTATION_GRID = (
     "tok3=L24@-2,L24@-1,L24@0; "
     "mix4=L23@-1,L23@0,L25@-1,L25@0; "
     "dup4=L24@0,L24@0,L24@0,L24@0; "
-    "tok3_shufctx=L24@-2,L24@-1,L24@0|shufctx"
+    "tok5=L24@-4,L24@-3,L24@-2,L24@-1,L24@0; "
+    "tok5w=L24@-7,L24@-4,L24@-2,L24@-1,L24@0; "
+    "dup5=L24@0,L24@0,L24@0,L24@0,L24@0; "
+    "tok3_shufctx=L24@-2,L24@-1,L24@0|shufctx; "
+    "tok5_shufctx=L24@-4,L24@-3,L24@-2,L24@-1,L24@0|shufctx; "
+    "tok5w_shufctx=L24@-7,L24@-4,L24@-2,L24@-1,L24@0|shufctx"
 )
