@@ -112,6 +112,56 @@ def build_av_prompt(k: int = N_SLOTS, placeholder: str = INJECT_PLACEHOLDER) -> 
     return [{"role": "user", "content": av_user_content(k, placeholder)}]
 
 
+# ---- Neutral k-general template (the permutation-grid experiments) ----
+# One uniform wording for ANY slot count, deliberately silent about what the
+# slots ARE (layers? positions? duplicates?): conditions at the same k must
+# differ ONLY in the injected vectors, never in the prompt text — the same
+# discipline that made §7's duplicate control valid (its prompt said
+# "Earlier/Centre/Later depth" over three identical vectors on purpose).
+# Legacy k∈{1,2,3} depth templates stay above for reproducing §7/§8 artifacts;
+# absolute FVE under the neutral template is NOT comparable to those runs.
+AV_NEUTRAL_HEADER = ("You are given {n} activation vector{s} captured from a "
+                     "language model's internal computation.\n")
+AV_NEUTRAL_SLOT = "Vector {i}: {m}\n"
+AV_NEUTRAL_FOOTER = "Describe the information represented in {ref}."
+
+
+def av_user_content_neutral(k: int, placeholder: str = INJECT_PLACEHOLDER) -> str:
+    """Uniform k-slot AV prompt body (one {m} marker per slot, slot order = text order)."""
+    assert k >= 1, f"k must be >= 1, got {k}"
+    head = AV_NEUTRAL_HEADER.format(n=k, s="" if k == 1 else "s")
+    slots = "".join(AV_NEUTRAL_SLOT.format(i=i + 1, m=placeholder) for i in range(k))
+    foot = AV_NEUTRAL_FOOTER.format(ref="this vector" if k == 1 else "these vectors")
+    return head + slots + foot
+
+
+def build_av_prompt_neutral(k: int, placeholder: str = INJECT_PLACEHOLDER) -> list:
+    return [{"role": "user", "content": av_user_content_neutral(k, placeholder)}]
+
+
+def load_stored_prompt(parquet_path: str, *, n_check: int = 64):
+    """The parquet's constant AV `prompt` column (list of chat messages), or None.
+
+    Eval/RL must generate with the SAME prompt the AV was trained on. Datasets
+    built by build_conditions store it; legacy sweep parquets don't (callers
+    fall back to build_av_prompt(k)). Asserts the prompt is constant over the
+    first `n_check` rows — a per-row-varying prompt would silently break the
+    single-prompt batching in evaluate_e2e/train_rl_multi.
+    """
+    pf = pq.ParquetFile(parquet_path)
+    if "prompt" not in pf.schema_arrow.names:
+        return None
+    field = pf.schema_arrow.field("prompt")
+    if not (pa.types.is_list(field.type) or pa.types.is_large_list(field.type)):
+        return None  # ar-style string prompt, not an AV chat prompt
+    col = next(pf.iter_batches(batch_size=n_check, columns=["prompt"])).column("prompt")
+    prompts = col.to_pylist()
+    assert prompts and all(p == prompts[0] for p in prompts), (
+        f"{parquet_path}: AV prompt varies across rows — single-prompt batching invalid"
+    )
+    return prompts[0]
+
+
 def apply_chat_template_no_think(tokenizer, msgs, *, add_generation_prompt=True) -> str:
     """Chat-template the AV prompt with Qwen3 thinking DISABLED (enable_thinking=False).
 
@@ -211,13 +261,19 @@ def stack_slot_vectors(rows: list, slot_cols) -> np.ndarray:
 # ---- Loading + AV-SFT chunk prep ----
 
 def load_av_sft_dataset(parquet_path: str, n_max: int | None = None,
-                        slot_cols=None) -> list:
+                        slot_cols=None, ram_dtype=np.float32) -> list:
     """Load AV-SFT rows: prompt (list[msg]) + response (str) + k AV-input activations.
 
     The condition lives in the DATA: `slot_cols` (default: the av_in_* columns
     present) are this dataset's AV-input layers — [L23,L24,L25] for local, [L24]x3
     for duplicate, [L20,L24,L28] for wide, [L24] for single. No load-time transform.
     Activations via flatten->numpy; slices row-groups so n_max is exact.
+
+    ram_dtype: in-RAM storage dtype for the slot vectors. np.float16 halves
+    resident memory for big-k permutation runs (250k rows x k=4 x d=4096 is
+    16 GB fp32, 8 GB fp16); batch prep upcasts to fp32. Injected values came
+    from bf16 compute, so within float16 range the fp16 round-trip is exact —
+    keep the fp32 default when in doubt.
     """
     if slot_cols is None:
         slot_cols = detect_av_slots(parquet_path)
@@ -236,7 +292,7 @@ def load_av_sft_dataset(parquet_path: str, n_max: int | None = None,
         def to_np(name):
             col = rg.column(name).combine_chunks()
             return (col.flatten().to_numpy(zero_copy_only=False)
-                    .astype(np.float32).reshape(len(col), -1))
+                    .astype(ram_dtype).reshape(len(col), -1))
 
         acts = {c: to_np(c) for c in slot_cols}
         for i in range(take):
@@ -248,6 +304,42 @@ def load_av_sft_dataset(parquet_path: str, n_max: int | None = None,
     return rows
 
 
+def _prompt_ids_cached(tokenizer, prompt_msgs, inject_char: str, inj_id: int, k: int):
+    """Chat-template + tokenize an AV prompt, with a per-tokenizer memo.
+
+    Every row of a condition dataset shares ONE constant prompt, but the old
+    path re-templated + re-tokenized it per row per epoch — for a 250k-row
+    epoch that is 250k redundant tokenizer calls on an identical string. The
+    memo (keyed by the marker-substituted message contents) collapses that to
+    one call per unique prompt. The k-marker guard runs once per unique prompt
+    for the same reason (the property is a function of the string, not the row).
+    """
+    key = tuple(
+        (m.get("role"), m["content"].replace(INJECT_PLACEHOLDER, inject_char))
+        if isinstance(m.get("content"), str) else (m.get("role"), None)
+        for m in prompt_msgs
+    )
+    cache = getattr(tokenizer, "_mlnla_prompt_cache", None)
+    if cache is None:
+        cache = {}
+        tokenizer._mlnla_prompt_cache = cache
+    hit = cache.get(key)
+    if hit is not None:
+        prompt_ids, n_mark = hit
+    else:
+        msgs = [{"role": r, "content": c} if c is not None else dict(prompt_msgs[i])
+                for i, (r, c) in enumerate(key)]
+        prompt_str = apply_chat_template_no_think(tokenizer, msgs)
+        prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
+        n_mark = sum(1 for t in prompt_ids if t == inj_id)
+        cache[key] = (prompt_ids, n_mark)
+    assert n_mark == k, (
+        f"AV prompt has {n_mark} marker tokens, expected k={k}. Template drift or "
+        f"the marker char split into multiple tokens under this tokenizer."
+    )
+    return prompt_ids
+
+
 def prepare_av_chunk_multi(rows: list, tokenizer, inject_char: str, inj_id: int,
                            device, *, max_len: int = 1024, slot_cols=None):
     """Build (input_ids, attn, loss_mask, vectors[B*k, d], prompt_lens[B]) for a multi-slot AV-SFT batch.
@@ -256,9 +348,11 @@ def prepare_av_chunk_multi(rows: list, tokenizer, inject_char: str, inj_id: int,
     lets the injection hook bound injection to the prompt span (the gold response is
     marker-free, so belt-and-suspenders here, but keeps the payload protocol == RL).
 
-    - prompt: chat-templated, with INJECT_PLACEHOLDER x k swapped to inject_char.
-    - per-example guard: assert exactly k marker tokens in the prompt (complements
-      the hook's per-row check; catches template/tokenizer drift before the forward).
+    - prompt: chat-templated + tokenized ONCE per unique prompt (memoized —
+      all rows of a condition share one constant prompt), with
+      INJECT_PLACEHOLDER x k swapped to inject_char.
+    - per-example guard: exactly k marker tokens in the prompt (checked on the
+      memoized ids; catches template/tokenizer drift before the forward).
     - response: trailing EOS so the model learns to stop; loss_mask = 1 on response
       tokens only (CE is response-only).
     - vectors: stack_slot_vectors -> [B*k, d] in scan order.
@@ -270,18 +364,7 @@ def prepare_av_chunk_multi(rows: list, tokenizer, inject_char: str, inj_id: int,
     k = len(slot_cols)
     full_ids_list, prompt_lens = [], []
     for row in rows:
-        msgs = [
-            {**m, "content": m["content"].replace(INJECT_PLACEHOLDER, inject_char)}
-            if isinstance(m.get("content"), str) else m
-            for m in row["prompt"]
-        ]
-        prompt_str = apply_chat_template_no_think(tokenizer, msgs)
-        prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
-        n_mark = sum(1 for t in prompt_ids if t == inj_id)
-        assert n_mark == k, (
-            f"AV prompt has {n_mark} marker tokens, expected k={k}. Template drift or "
-            f"the marker char split into multiple tokens under this tokenizer."
-        )
+        prompt_ids = _prompt_ids_cached(tokenizer, row["prompt"], inject_char, inj_id, k)
         resp = row["response"] + (tokenizer.eos_token or "")
         resp_ids = tokenizer.encode(resp, add_special_tokens=False)
         full = prompt_ids + resp_ids
@@ -329,12 +412,15 @@ def fill_ar_prompt(explanation: str) -> str:
     return AR_CRITIC_TEMPLATE.format(explanation=explanation)
 
 
-def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None) -> list:
+def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None,
+                        ram_dtype=np.float32) -> list:
     """Load AR-SFT rows: prompt (filled critic text, str) + the 3 fixed targets.
 
     Targets are AR_TARGET_COLUMNS (activation_prev/centre/next == L23/L24/L25) for
     EVERY condition — the AR reconstructs the same local state regardless of what the
-    AV saw. No condition transform.
+    AV saw. No condition transform. ram_dtype: see load_av_sft_dataset — NB fp16
+    here quantizes the reconstruction TARGETS (tiny loss-surface change); prefer
+    the fp32 default for the AR unless memory-bound.
     """
     cols = ["prompt", *AR_TARGET_COLUMNS]
     pf = pq.ParquetFile(parquet_path)
@@ -350,7 +436,7 @@ def load_ar_sft_dataset(parquet_path: str, n_max: int | None = None) -> list:
         def to_np(name):
             col = rg.column(name).combine_chunks()
             return (col.flatten().to_numpy(zero_copy_only=False)
-                    .astype(np.float32).reshape(len(col), -1))
+                    .astype(ram_dtype).reshape(len(col), -1))
 
         acts = {c: to_np(c) for c in AR_TARGET_COLUMNS}
         for i in range(take):
@@ -375,7 +461,12 @@ def prepare_ar_chunk_multi(rows: list[dict], tokenizer, device, *, max_len: int 
     ids_list, kept = [], []
     n_skipped = 0
     for row in rows:
-        ids = tokenizer.encode(row["prompt"], add_special_tokens=False)
+        # Lazy per-row token memo: AR prompts are per-row explanations, and the
+        # trainer revisits every row each epoch — tokenize once, reuse after.
+        ids = row.get("_ids")
+        if ids is None:
+            ids = tokenizer.encode(row["prompt"], add_special_tokens=False)
+            row["_ids"] = ids
         if len(ids) > max_len:
             n_skipped += 1
             continue

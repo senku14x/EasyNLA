@@ -293,10 +293,16 @@ def bootstrap_overall(errs, doc_ids, baselines, n_boot, seed, penalized):
 
 def evaluate(actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids,
              rows, k, mse_scale, device, *, max_new_tokens=150, batch_size=32,
-             shuffle_seed=0):
-    """Run the full pipeline; return (per_example list, generated_texts, expls)."""
+             shuffle_seed=0, prompt_msgs=None):
+    """Run the full pipeline; return (per_example list, generated_texts, expls).
+
+    prompt_msgs: the AV chat prompt to generate with. Pass the eval parquet's
+    stored prompt (load_stored_prompt) so generation matches AV training for
+    ANY k / template; None falls back to the legacy k-keyed build_av_prompt.
+    """
     from nla.schema import INJECT_PLACEHOLDER
-    prompt_msgs = build_av_prompt(k)
+    if prompt_msgs is None:
+        prompt_msgs = build_av_prompt(k)
     prompt_text = apply_chat_template_no_think(
         tokenizer, [{**m, "content": m["content"].replace(INJECT_PLACEHOLDER, inject_char)}
                     for m in prompt_msgs])
@@ -357,7 +363,10 @@ def main():
     device = "cuda"
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     rows, k = load_eval_rows(args.eval_parquet)
-    print(f"[eval:{args.condition}] {len(rows)} rows, k={k} AV slots, ar_target=[L23,L24,L25]")
+    from multilayer_nla.datasets import load_stored_prompt
+    stored_prompt = load_stored_prompt(args.eval_parquet)
+    print(f"[eval:{args.condition}] {len(rows)} rows, k={k} AV slots, ar_target=[L23,L24,L25], "
+          f"prompt={'stored-in-parquet' if stored_prompt else f'legacy build_av_prompt({k})'}")
 
     actor, tokenizer, inject_char, inj_id, vectors_ref, eos_ids = load_actor(
         args.base_ckpt, args.av_ckpt, k, args.quant, device)
@@ -378,7 +387,8 @@ def main():
 
     texts, lens, expls, errs = evaluate(
         actor, tokenizer, critic, inject_char, inj_id, vectors_ref, eos_ids, rows, k,
-        mse_scale, device, max_new_tokens=args.max_new_tokens, batch_size=args.batch_size)
+        mse_scale, device, max_new_tokens=args.max_new_tokens, batch_size=args.batch_size,
+        prompt_msgs=stored_prompt)
 
     agg = aggregate(errs, baselines)
     doc_ids = [r["doc_id"] for r in rows]

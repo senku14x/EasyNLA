@@ -112,6 +112,9 @@ def main():
     p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--attn-implementation", default="sdpa")
     p.add_argument("--max-rows", type=int, default=None)
+    p.add_argument("--ram-dtype", choices=["float32", "float16"], default="float32",
+                   help="in-RAM dtype for loaded activations; float16 halves resident memory "
+                        "for big-k permutation datasets (batch prep upcasts to fp32)")
     p.add_argument("--eval-parquet", default=None,
                    help="optional held-out AV parquet (response CE on unseen docs); the headline AV "
                         "metric is end-to-end (evaluate_e2e), not this CE. The condition lives in the "
@@ -172,11 +175,13 @@ def main():
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
 
-    rows = load_av_sft_dataset(args.parquet, n_max=args.max_rows, slot_cols=slot_cols)
+    ram_dtype = np.float16 if args.ram_dtype == "float16" else np.float32
+    rows = load_av_sft_dataset(args.parquet, n_max=args.max_rows, slot_cols=slot_cols,
+                               ram_dtype=ram_dtype)
     print(f"[av] {len(rows)} rows")
     eval_rows = None
     if args.eval_parquet:
-        eval_rows = load_av_sft_dataset(args.eval_parquet, slot_cols=slot_cols)
+        eval_rows = load_av_sft_dataset(args.eval_parquet, slot_cols=slot_cols, ram_dtype=ram_dtype)
         print(f"[av] held-out eval: {len(eval_rows)} rows from {args.eval_parquet}")
 
     try:

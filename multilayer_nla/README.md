@@ -20,22 +20,25 @@ repo's `EXPERIMENT_REPORT.md` / `SWEEP_STATUS.md` / `docs/layer_combos_explained
 | `verify_bank.py` | post-build integrity gate (schema, finiteness, last-slot parity, stored-vector + reference cross-parity) | CPU |
 | `verify_center_parity.py` | multi-hook center tap == legacy single-layer extraction (bitwise) | GPU |
 | `verify_regen_parity.py` | final-token gather == legacy final token on published prefixes (bitwise) | GPU |
-| `build_from_published.py` | bank → av/ar/rl training parquets for a chosen `--center` (re-slice, no re-extraction) | CPU |
+| `conditions.py` | **slot-spec grammar**: `L24@0`, `L23@-2`, flags `\|pool` `\|shufctx`; the pre-registered `PERMUTATION_GRID` | — |
+| `build_conditions.py` | **bank → per-condition datasets for ANY layers×positions grid** (fixed target, stored prompt, preflight) | CPU |
+| `build_from_published.py` | bank → plain av/ar/rl training parquets for a chosen `--center` (the no-conditions warmstart path) | CPU |
 | `split_parquet.py` | doc-level train/val materialization of a built parquet (+ manifest) | CPU |
-| `splits.py` | doc-level train/dev/test manifests (+ locked eval subsets) | CPU |
+| `splits.py` | doc-level train/dev/test manifests (+ locked eval subsets) — feeds build_conditions | CPU |
 | `train_ar_multi.py` | multi-tap AR (truncated backbone + per-depth heads) SFT warm-start | GPU |
-| `train_av_multi.py` | k-slot AV (multi-marker Karvonen injection) SFT warm-start | GPU |
-| `train_rl_multi.py` | single-GPU GRPO (⚠ legacy fixed 3-slot scheme, not `av_in_*`-aware) | GPU |
+| `train_av_multi.py` | k-slot AV SFT warm-start (any k; memoized prompt tokenization; `--ram-dtype float16`) | GPU |
+| `train_rl_multi.py` | single-GPU GRPO, **k-general** (injects the parquet's `av_in_*`, fixed target sliced to the AR's taps, greedy held-out eval) | GPU |
+| `distill_av.py` | **warmstart improvement, API-free**: gold-label AR scoring/filtering + best-of-N self-distillation | GPU |
 | `evaluate_e2e.py` | held-out end-to-end FVE: AV text → AR → fixed targets, bootstrap CIs over documents, shuffled control | GPU |
 | `eval_ar_gold.py` | AR-only gold ceiling (localizes verbalizer vs reconstructor bottleneck) | GPU |
 | `extract_multilayer.py` | fresh-corpus stage-0 (keyed-RNG positions) + the `MultiLayerHFExtractor` everything above uses | GPU |
-| `datasets.py` `injection_multi.py` `models_multi.py` | k-slot prompt/loaders, multi-marker injection, multi-tap critic | — |
-| `tests/` | 96 offline tests incl. a CPU end-to-end smoke on a tiny in-memory model | anywhere |
+| `datasets.py` `injection_multi.py` `models_multi.py` | k-slot prompt/loaders (legacy + neutral templates), multi-marker injection, multi-tap critic | — |
+| `tests/` | 117 offline tests incl. a CPU end-to-end extractor smoke + a synthetic-bank build_conditions round trip | anywhere |
 
-Not ported (completed-phase / sweep-specific, in the parent repo if needed):
-`build_sweep.py`, `analyze_sweep.py`, `select_and_report`-driven §7 sweep
-harness (a trimmed `select_and_report.py` IS here), `headroom.py` (Gate 0),
-`progressive_reader/`, ops/cluster scripts.
+Not ported (completed-phase / superseded, in the parent repo if needed):
+`build_sweep.py` (superseded by `build_conditions.py` — every §7 condition is
+expressible in the slot grammar, `conditions.LEGACY_SWEEP`), `analyze_sweep.py`,
+`headroom.py` (Gate 0), `progressive_reader/`, ops/cluster scripts.
 
 ## The unified bank (why one pass)
 
@@ -191,6 +194,54 @@ bf16 (`--quant none`) moved AR-gold 0.624→0.67. AV at 1000 steps / batch 64.
 The two `--eval-parquet` flags give train-time held-out curves; the step-5
 evals are the reportable numbers.
 
+## Permutation-grid runbook (after the bank exists)
+
+```bash
+# 0. doc-level split manifests over the rl + ar banks (locked eval subsets)
+COND=/data/mlnla/cond_grid
+python -m multilayer_nla.splits --source "$BANK/rl.parquet" --name rl --out-dir $COND \
+    --seed 42 --fracs 0.8,0.1,0.1 --dev-subset 256 --test-subset 1000
+python -m multilayer_nla.splits --source "$BANK/ar_sft.parquet" --name ar --out-dir $COND --seed 42
+
+# 1. build every condition dataset (CPU; re-runnable for any new grid without GPU)
+python -m multilayer_nla.build_conditions --mode all --conditions-preset permutation_grid \
+    --in-dir $BANK --out-dir $COND \
+    --rl-split-manifest $COND/rl_split_manifest.json --ar-split-manifest $COND/ar_split_manifest.json \
+    --av-with-targets --base-ckpt Qwen/Qwen3-8B
+# custom grids: --conditions "tok5=L24@-4,L24@-3,L24@-2,L24@-1,L24@0; dup5=L24@0,L24@0,L24@0,L24@0,L24@0"
+# (validated against the bank: any slot L{k}@-j needs window_L{k} with W > j)
+
+# 2. ONE shared AR (never retrained per condition), then one AV per condition
+python -m multilayer_nla.train_ar_multi --base-ckpt Qwen/Qwen3-8B \
+    --parquet $COND/ar_common.parquet --eval-parquet $COND/ar_dev.parquet \
+    --save-dir /data/ckpt/ar_3tap --tap-layers 23,24,25 --use-lora --quant none \
+    --num-steps 3000 --batch-size 64 --gradient-accumulation-steps 4 --lr 1e-4
+for c in single dup3 lay3 tok3 mix4 dup4; do
+  python -m multilayer_nla.train_av_multi --base-ckpt Qwen/Qwen3-8B \
+      --parquet $COND/av_$c.parquet --save-dir /data/ckpt/av_$c --use-lora --quant none \
+      --num-steps 1000 --batch-size 64 --wandb-name av_$c
+done
+
+# 3. eval: dev for selection, test ONCE; shufctx evaluated with tok3's AV
+for c in single dup3 lay3 tok3 mix4 dup4; do
+  python -m multilayer_nla.evaluate_e2e --base-ckpt Qwen/Qwen3-8B \
+      --av-ckpt /data/ckpt/av_$c/iter_0001000 --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 \
+      --eval-parquet $COND/rl_test_$c.parquet --condition $c \
+      --out /data/eval/test_$c.jsonl --summary /data/eval/test_$c.json
+done
+python -m multilayer_nla.evaluate_e2e --base-ckpt Qwen/Qwen3-8B \
+    --av-ckpt /data/ckpt/av_tok3/iter_0001000 --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 \
+    --eval-parquet $COND/rl_test_tok3_shufctx.parquet --condition tok3_shufctx \
+    --out /data/eval/test_tok3_shufctx.jsonl --summary /data/eval/test_tok3_shufctx.json
+
+# 4. optional warmstart improvement round (see below), then re-train + re-eval
+python -m multilayer_nla.distill_av --mode score-gold --in $COND/av_lay3.parquet \
+    --out $COND/av_lay3_scored.parquet --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 --filter-quantile 0.2
+python -m multilayer_nla.distill_av --mode bon --in $COND/av_tok3.parquet \
+    --out $COND/av_tok3_bon8.parquet --av-ckpt /data/ckpt/av_tok3/iter_0001000 \
+    --ar-ckpt /data/ckpt/ar_3tap/iter_0003000 --n-samples 8 --max-rows 50000
+```
+
 ## Invariants (the contract — do not break)
 
 - **RAW storage everywhere** (`norm="none"`); normalization only at injection
@@ -213,26 +264,74 @@ evals are the reportable numbers.
   injection failure makes the actor free-associate Chinese). The mechanism
   check is the per-row marker-count guard, which RL cannot erode.
 
-## Windowed data downstream (pre-registered, NOT yet built)
+## The permutation grid (pre-registered)
 
-The bank's `window_L{k}` columns are inert until an AV consumes a W-slot
-window. The pilot design (from the parent repo, kept as the pre-registration):
-three arms varying ONLY the AV input against the same frozen AR + fixed target
-at p — `single` (W=1), `window` (true W-window), `dup` (p-vector ×W: same
-marker count, zero extra information — the load-bearing control), plus a
-shuffled-window control. Decision rule: `window − dup` paired doc-bootstrap CI
-excludes 0 AND `window > shuffled` ⇒ context helps; `window ≈ dup ≈ single` ⇒
-null (adjacent late positions are collinear; report either outcome).
+**Primary question.** At a MATCHED slot count k, does position diversity
+(several token positions, one layer) carry more recoverable information
+through the language bottleneck than layer diversity (several layers, one
+position)? Prior §7/§8 results say layer diversity is real but small
+(+1.6pp; adjacent layers are largely redundant — consistent with the SAE
+literature's slowly-drifting residual features across depth). Adjacent
+POSITIONS carry genuinely different content, so the prediction to beat is
+`tok3 > lay3 > dup3 > single`. The main alternative: late-position states
+already summarize their context (the progressive-reader-style null), giving
+`tok3 ≈ dup3`.
+
+`conditions.PERMUTATION_GRID` (build with `--conditions-preset permutation_grid`):
+
+| condition | slots | role |
+|---|---|---|
+| `single` | L24@0 | baseline (k=1) |
+| `dup3` | L24@0 ×3 | marker-count control (k=3, zero extra info) |
+| `lay3` | L23@0, L24@0, L25@0 | layer diversity (k=3) — §7 `local` |
+| `tok3` | L24@-2, L24@-1, L24@0 | **position diversity (k=3)** |
+| `mix4` | L23@-1, L23@0, L25@-1, L25@0 | positions × layers interaction (k=4) |
+| `dup4` | L24@0 ×4 | marker-count control at k=4 |
+| `tok3_shufctx` | tok3 \| shufctx | eval-only: context slots from another doc, final true |
+
+Every condition reconstructs the SAME fixed target (default [L23,L24,L25]@p);
+same-k conditions share ONE neutral prompt (identical text — only the vectors
+differ); dev selects checkpoints, test is touched once. Decision rules
+(paired doc-bootstrap, evaluate_e2e):
+- `tok3 − dup3` CI excludes 0 AND `tok3 > tok3_shufctx` ⇒ position context is
+  used as this-document context (proceed to wider windows / RL on the winner).
+- `tok3 ≈ dup3 ≈ single` ⇒ the multitoken null: late positions are collinear
+  for this channel — report it and stop investing in position slots.
+- `lay3 − dup3` should reproduce §7's +1.6pp under the neutral template
+  (a recipe sanity anchor, not a new claim).
+
+## Warmstart improvement (the actual bottleneck)
+
+SFT imitates gold, and the gold ceiling is what caps the warm start. Two
+API-free levers in `distill_av.py`, both scored by the frozen AR against the
+FIXED target:
+
+1. **`--mode score-gold`** — score every published label; report the reward
+   distribution; `--filter-quantile 0.2` drops the worst 20% (labels the
+   reconstructor can't map toward the target teach style, not content).
+2. **`--mode bon`** — best-of-N self-distillation (ReST-style RL-lite): sample
+   N explanations per row from the SFT AV, keep the best-scoring (gold
+   included in the argmax), SFT again on the winners. Besides raising reward,
+   this **de-layer-blinds the labels**: published explanations only ever
+   described the single L24 vector, but BoN selects against the full fixed
+   multi-layer target.
+
+Caution (research-notes §10.1): BoN optimizes text against the SAME AR that
+scores it. The honest number is held-out e2e FVE after the continuation SFT
+round, cross-checked with an independently trained AR before any faithfulness
+language; watch explanation diversity / text_judges for reward-hacked
+templates.
 
 ## Known limitations
 
-- `train_rl_multi.py` is the parent repo's fixed 3-slot GRPO (SLOT_COLUMNS
-  scheme); it is NOT `av_in_*`-aware and does NOT use EasyNLA's fast
-  distributed vLLM path. Wiring multi-slot injection into `vllm-lens` is open
+- `train_rl_multi.py` is single-GPU (k-general now, but NOT EasyNLA's fast
+  distributed vLLM path). Wiring multi-slot injection into `vllm-lens` is open
   work — warm-start + SFT-level comparisons don't need it.
 - Extraction batch composition differs from the original stage-0 run, so
   stored-vs-regenerated vectors match to bf16 batching noise (cos ~0.9999),
   not bitwise. The verifiers' `--strict` mode is only for batch-identical
   forwards.
+- Neutral-template FVE is NOT comparable to §7/§8 legacy-template numbers;
+  re-run baselines inside each experiment.
 - Tested against `transformers==4.57.1` (the repo pin). v5 breaks
   `apply_chat_template` usage in the trainers.

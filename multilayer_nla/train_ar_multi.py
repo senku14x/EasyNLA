@@ -114,6 +114,9 @@ def main():
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--strip-final-norm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--max-rows", type=int, default=None)
+    p.add_argument("--ram-dtype", choices=["float32", "float16"], default="float32",
+                   help="in-RAM dtype for loaded activations; float16 halves resident memory "
+                        "for big-k permutation datasets (batch prep upcasts to fp32)")
     p.add_argument("--eval-parquet", default=None,
                    help="held-out AR eval parquet (ar_dev.parquet / ar_test.parquet). Reports per-tap "
                         "gold FVE on docs unseen in AR training: gold explanation -> shared AR -> fixed "
@@ -175,7 +178,8 @@ def main():
         print(f"[ar] LoRA-injected; trainable {n_tr / 1e6:.1f}M (lora + {len(tap_layers)} heads)")
     model.train()
 
-    rows = load_ar_sft_dataset(args.parquet, n_max=args.max_rows)
+    ram_dtype = np.float16 if args.ram_dtype == "float16" else np.float32
+    rows = load_ar_sft_dataset(args.parquet, n_max=args.max_rows, ram_dtype=ram_dtype)
     d_model = int(np.asarray(rows[0][SLOT_COLUMNS[0]]).shape[-1])
     mse_scale = math.sqrt(d_model)
     print(f"[ar] {len(rows)} rows, d_model={d_model}, mse_scale={mse_scale:.3f}, taps={tap_layers}")
@@ -184,7 +188,7 @@ def main():
           ", ".join(f"{nm}={b:.4f}" for nm, b in zip(tap_names, baselines)))
     eval_rows = eval_baselines = None
     if args.eval_parquet:
-        eval_rows = load_ar_sft_dataset(args.eval_parquet)
+        eval_rows = load_ar_sft_dataset(args.eval_parquet, ram_dtype=ram_dtype)
         eval_baselines = _per_tap_baselines(eval_rows, mse_scale, target_cols)
         print(f"[ar] held-out eval: {len(eval_rows)} rows from {args.eval_parquet}; baselines " +
               ", ".join(f"{nm}={b:.4f}" for nm, b in zip(tap_names, eval_baselines)))

@@ -1,4 +1,9 @@
-"""Multi-layer RL (GRPO) — three-slot rollout + three-target reward (plan §6.3, §8).
+"""Multi-layer RL (GRPO) — k-slot av_in rollout + fixed-target reward (plan §6.3, §8).
+
+DECOUPLED (k-general, like evaluate_e2e): the AV INPUT is the parquet's `av_in_*` slots
+(k∈{1,2,3}, auto-detected — so ANY condition/combo RLs correctly), and the AR TARGET is the
+fixed activation_prev/centre/next sliced to the AR ckpt's `tap_layers`. The injection count
+follows the data (k markers); the reconstruction target follows the AR checkpoint.
 
 Extends the self-contained single-GPU GRPO trainer (nla/train_rl_self_contained)
 to the coherent-patch NLA:
@@ -28,20 +33,24 @@ import torch.nn.functional as F
 
 from nla.schema import compute_predict_mean_baselines, normalize_activation
 from multilayer_nla.datasets import (
-    SLOT_COLUMNS,
+    AR_LAYER_TO_TARGET_COL,
+    AR_TARGET_COL_TO_NAME,
+    AR_TARGET_COLUMNS,
+    apply_chat_template_no_think,
     build_av_prompt,
+    detect_av_slots,
     fill_ar_prompt,
 )
 from multilayer_nla.injection_multi import register_multislot_hook
 from multilayer_nla.models_multi import (
-    DEFAULT_TAP_LAYERS,
     multitap_predict,
     three_target_reward,
 )
 
-N_SLOTS = len(SLOT_COLUMNS)
 FAILED_EXTRACTION_REWARD = -2.0  # orthogonal-equivalent worst case under √d-normalized MSE
-SLOT_NAMES = ("prev", "centre", "next")
+# AV INPUT = av_in_* slots (k∈{1,2,3}, detected per parquet); AR TARGET = the fixed
+# activation_prev/centre/next, sliced to the critic's taps. Decoupled exactly like evaluate_e2e,
+# so ANY condition/combo RLs correctly (inject k av_in vectors; reconstruct the fixed target).
 
 
 def cjk_fraction(text: str) -> float:
@@ -90,53 +99,68 @@ def grpo_surrogate(new_lp, old_lp, ref_lp, advantage, clip_eps=0.2, kl_beta=0.01
 # ---- data ----
 
 def load_rl_dataset_multi(parquet_path, n_max=None):
+    """Rows with av_in (acts [k,d] = the INJECTED input) + gold ([3,d] = the fixed
+    L23/24/25 target). k = number of `av_in_*` slots (detected). Mirrors
+    evaluate_e2e.load_eval_rows: RL injects exactly what the AV was trained on and
+    reconstructs the fixed target — decoupled, so any condition/combo RLs correctly.
+    Returns (rows, k)."""
     import pyarrow.parquet as pq
+    slot_cols = detect_av_slots(parquet_path)          # av_in_* in slot order (k of them)
+    cols = [*slot_cols, *AR_TARGET_COLUMNS]
     pf = pq.ParquetFile(parquet_path)
     rows = []
     for rg_idx in range(pf.num_row_groups):
         if n_max is not None and len(rows) >= n_max:
             break
-        rg = pf.read_row_group(rg_idx, columns=["prompt", *SLOT_COLUMNS])
+        rg = pf.read_row_group(rg_idx, columns=cols)
         take = rg.num_rows if n_max is None else min(n_max - len(rows), rg.num_rows)
         rg = rg.slice(0, take)
-        prompts = rg.column("prompt").to_pylist()
 
         def to_np(name):
             col = rg.column(name).combine_chunks()
             return (col.flatten().to_numpy(zero_copy_only=False)
                     .astype(np.float32).reshape(len(col), -1))
 
-        acts = {c: to_np(c) for c in SLOT_COLUMNS}
+        av = {c: to_np(c) for c in slot_cols}
+        gd = {c: to_np(c) for c in AR_TARGET_COLUMNS}
         for i in range(take):
-            rows.append({"prompt": prompts[i], "acts": np.stack([acts[c][i] for c in SLOT_COLUMNS])})
-    return rows
+            rows.append({"acts": np.stack([av[c][i] for c in slot_cols]),          # [k, d] av_in (inject)
+                         "gold": np.stack([gd[c][i] for c in AR_TARGET_COLUMNS])})  # [3, d] fixed target
+    return rows, len(slot_cols)
 
 
-def build_prompt_text(prompt_msgs, inject_char, tokenizer):
+def build_prompt_text(k, inject_char, tokenizer, prompt_msgs=None):
+    """The k-marker AV prompt with the injection placeholder swapped for the marker char.
+
+    prompt_msgs: the rl parquet's STORED prompt (datasets.load_stored_prompt) — pass it
+    so RL rolls out with exactly the prompt the AV was SFT'd on, for ANY k / template
+    (permutation-grid conditions use the neutral template, which the legacy k-keyed
+    build_av_prompt cannot reconstruct). None falls back to the legacy template.
+    enable_thinking=False — identical to AV-SFT prep, or the actor sees a different
+    prompt than it learned (and Qwen3 burns the budget on <think>)."""
     from nla.schema import INJECT_PLACEHOLDER
-    from multilayer_nla.datasets import apply_chat_template_no_think
     msgs = [
         {**m, "content": m["content"].replace(INJECT_PLACEHOLDER, inject_char)}
         if isinstance(m.get("content"), str) else m
-        for m in prompt_msgs
+        for m in (prompt_msgs if prompt_msgs is not None else build_av_prompt(k))
     ]
-    # enable_thinking=False — identical to AV-SFT prep, or the actor sees a
-    # different prompt than it learned (and Qwen3 burns the budget on <think>).
     return apply_chat_template_no_think(tokenizer, msgs)
 
 
 @torch.no_grad()
-def rollout_multislot(actor, tokenizer, prompt_text, acts3, vectors_ref, inj_id,
+def rollout_multislot(actor, tokenizer, prompt_text, acts_k, vectors_ref, inj_id,
                       group_size, max_new_tokens, temperature, device, eos_ids):
-    """Generate group_size samples; inject the SAME 3 raw activations at the 3
-    markers of every sample. acts3: [3, d]. Returns per-sample dicts."""
+    """Generate group_size samples; inject the SAME k raw av_in activations at the k
+    markers of every sample. acts_k: [k, d] (k = the AV's av_in slot count). Returns
+    per-sample dicts."""
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
     prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     plen = prompt_t.shape[1]
     batched = prompt_t.expand(group_size, -1).contiguous()
-    # [G, 3, d] -> [G*3, d] example-major: matches the row-major 3-marker scan.
-    v = torch.as_tensor(acts3, dtype=torch.float32, device=device)
-    v_batch = v.unsqueeze(0).expand(group_size, -1, -1).reshape(group_size * N_SLOTS, -1).contiguous()
+    # [G, k, d] -> [G*k, d] example-major: matches the row-major k-marker scan.
+    v = torch.as_tensor(acts_k, dtype=torch.float32, device=device)  # accepts list/ndarray/tensor
+    k = v.shape[0]
+    v_batch = v.unsqueeze(0).expand(group_size, -1, -1).reshape(group_size * k, -1).contiguous()
     # Injection is bounded to the prompt span (prompt_lens). generate() injects only on
     # the prefill (the prompt; response tokens are cache steps where the hook no-ops),
     # so the whole prefill is the prompt. We deliberately do NOT suppress the marker
@@ -195,6 +219,64 @@ def score_with_multitap_critic(critic, tokenizer, explanations, golds, mse_scale
     return rewards
 
 
+@torch.no_grad()
+def greedy_eval(actor, tokenizer, critic, eval_rows, eval_baselines,
+                mse_scale, inject_char, vectors_ref, eos_ids, device,
+                max_new_tokens=150, batch_size=32, prompt_text=None):
+    """Held-out GREEDY eval (do_sample=False) on the 'default' policy → the 'real' number.
+
+    Same pipeline as the training rollout but greedy: inject the k av_in slots → AV greedy-gen →
+    extract → frozen AR → FVE vs the fixed target (rows carry pre-sliced 'gold'). The training
+    loop logs SAMPLED (T=1) FVE, which runs ~10pp BELOW this; watch THIS climb. Baselines are
+    the held-out split's own. `prompt_text` (from main) is the SAME rendered prompt the
+    rollout uses (stored-in-parquet when available). Returns success-only +
+    failure-penalized FVE + extraction rate.
+    """
+    from nla.schema import extract_explanation
+    was_training = actor.training
+    actor.eval()
+    k = eval_rows[0]["acts"].shape[0]
+    if prompt_text is None:
+        prompt_text = build_prompt_text(k, inject_char, tokenizer)
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    rewards = []  # per-row three_target_reward (= -MSE) or None (failed extraction)
+    b = float(np.mean(eval_baselines))
+    for cs in range(0, len(eval_rows), batch_size):
+        chunk = eval_rows[cs:cs + batch_size]
+        B = len(chunk)
+        prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=device).expand(B, -1).contiguous()
+        plen = prompt_t.shape[1]
+        acts_bk = np.stack([r["acts"] for r in chunk])                              # [B, k, d]
+        v_batch = torch.as_tensor(acts_bk, dtype=torch.float32, device=device).reshape(B * k, -1)
+        vectors_ref[0] = {"vectors": v_batch,
+                          "prompt_lens": torch.full((B,), plen, dtype=torch.long, device=device)}
+        try:
+            gen = actor.generate(
+                input_ids=prompt_t, attention_mask=torch.ones_like(prompt_t),
+                max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.eos_token_id, return_dict_in_generate=True)
+        finally:
+            vectors_ref[0] = None
+        seqs = gen.sequences
+        expls, golds = [], []
+        for r_ in range(B):
+            resp_ids = seqs[r_, plen:].tolist()
+            n_real = next((i + 1 for i, t in enumerate(resp_ids) if t in eos_ids), len(resp_ids))
+            text = tokenizer.decode(resp_ids[:n_real], skip_special_tokens=True)
+            e = extract_explanation(text)
+            expls.append(e if (e and e.strip()) else None)
+            golds.append(chunk[r_]["gold"])          # fixed target, pre-sliced to the AR's taps in main()
+        rewards.extend(score_with_multitap_critic(critic, tokenizer, expls, golds, mse_scale, device))
+    if was_training:
+        actor.train()
+    valid = [r for r in rewards if r is not None]
+    succ_fve = (1.0 - (-float(np.mean(valid))) / b) if valid else float("nan")
+    pen = [r if r is not None else -b for r in rewards]  # fail = predict-the-mean = per-row FVE 0
+    pen_fve = (1.0 - (-float(np.mean(pen))) / b) if rewards else float("nan")
+    return {"fve_greedy": succ_fve, "pen_fve_greedy": pen_fve,
+            "extraction_rate": len(valid) / max(len(rewards), 1), "n": len(rewards)}
+
+
 def _grpo_update(actor, optim, tokenizer, full_ids_list, prompt_lens, acts_list,
                  old_logps, advantages, vectors_ref, device, micro_batch,
                  clip_eps, kl_beta, max_grad_norm):
@@ -215,9 +297,9 @@ def _grpo_update(actor, optim, tokenizer, full_ids_list, prompt_lens, acts_list,
             L = full_ids_list[i].numel()
             batch_ids[r, :L] = full_ids_list[i].to(device)
             attn[r, :L] = 1
-        # vectors: each row's 3 acts -> [bs*3, d] example-major
+        # vectors: each row's k av_in acts -> [bs*k, d] example-major
         v = torch.stack([torch.as_tensor(acts_list[i], dtype=torch.float32, device=device) for i in idxs])
-        v_batch = v.reshape(bs * N_SLOTS, -1)
+        v_batch = v.reshape(bs * v.shape[1], -1)   # v: [bs, k, d]
         # Bound injection to each row's prompt span: this forward is over prompt+response,
         # but rollout injected ONLY at the prompt prefill — markers in the generated
         # response are NOT injection sites (and would otherwise trip the count guard).
@@ -280,13 +362,9 @@ def _grpo_update(actor, optim, tokenizer, full_ids_list, prompt_lens, acts_list,
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--av-ckpt", required=True, help="AV-SFT LoRA dir (policy init + frozen KL reference)")
-    p.add_argument("--ar-ckpt", required=True, help="AR multitap dir (ar_multitap.safetensors + ar_meta.json)")
-    p.add_argument("--ar-target-slots", default="prev,centre,next",
-                   help="Which AV-input slots the AR reconstructs (comma-sep of prev,centre,next). "
-                        "Default = all 3 (reconstruct L23/24/25). Use 'centre' to reconstruct L24 ONLY "
-                        "from the SAME 3-slot AV input. Count MUST equal the critic's tap count "
-                        "(slot k -> tap k). Decouples the AR target from the 3-slot injection; the "
-                        "injection is always all 3 slots.")
+    p.add_argument("--ar-ckpt", required=True,
+                   help="AR multitap dir (ar_multitap.safetensors + ar_meta.json). The AR's tap_layers "
+                        "set the reconstruction target; the AV input is the parquet's av_in_* slots (k).")
     p.add_argument("--base-ckpt", default="Qwen/Qwen3-8B")
     p.add_argument("--quant", choices=["none", "4bit"], default="none")
     p.add_argument("--rl-parquet", required=True)
@@ -304,6 +382,11 @@ def main():
     p.add_argument("--logp-micro-batch", type=int, default=2)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--max-rows", type=int, default=None)
+    p.add_argument("--eval-parquet", default=None,
+                   help="held-out DEV shard (rl_dev_<cond>.parquet, same columns as --rl-parquet) for "
+                        "the periodic GREEDY eval = the 'real' FVE. Omit to skip (log sampled FVE only).")
+    p.add_argument("--eval-every", type=int, default=50, help="greedy held-out eval cadence (steps; includes step 0)")
+    p.add_argument("--eval-rows", type=int, default=256, help="cap held-out eval rows (speed vs noise)")
     p.add_argument("--save-every", type=int, default=50)
     p.add_argument("--no-kl-step0-check", action="store_true",
                    help="skip the Fix-4 assertion that step-0 KL≈0 (only when intentionally resuming)")
@@ -348,7 +431,9 @@ def main():
     actor.train()
 
     vectors_ref = [None]
-    register_multislot_hook(actor, vectors_ref, inj_id, N_SLOTS, layer_idx=1)
+    k = len(detect_av_slots(args.rl_parquet))   # av_in_* slot count = markers injected per example
+    register_multislot_hook(actor, vectors_ref, inj_id, k, layer_idx=1)
+    print(f"[rl] k={k} av_in slot(s) injected per example (from {Path(args.rl_parquet).name})")
     eos_ids = {tokenizer.eos_token_id}
     _gc = getattr(getattr(actor, "generation_config", None), "eos_token_id", None)
     if _gc is not None:
@@ -381,26 +466,41 @@ def main():
     critic.eval()
     print(f"[rl] critic taps={tap_layers} mse_scale={mse_scale:.3f}; loaded {len(_sd)} AR tensors")
 
-    # AR target-slot selection (decoupled from the always-3-slot AV injection). slot k -> tap k.
-    target_slots = [s.strip() for s in args.ar_target_slots.split(",") if s.strip()]
-    bad = [s for s in target_slots if s not in SLOT_NAMES]
-    assert not bad, f"--ar-target-slots {bad} not in {SLOT_NAMES}"
-    target_slot_idx = [SLOT_NAMES.index(s) for s in target_slots]
-    assert len(target_slot_idx) == len(tap_layers), (
-        f"--ar-target-slots has {len(target_slot_idx)} slots {target_slots} but the AR critic has "
-        f"{len(tap_layers)} taps {tap_layers} — they must match (slot k -> tap k). For L24-only, use a "
-        f"1-tap AR (tap_layers=[24]) with --ar-target-slots centre.")
-    print(f"[rl] AR reconstructs slots={target_slots} (idx {target_slot_idx}) with critic taps {tap_layers}")
+    # AR TARGET = the fixed activation_prev/centre/next, sliced to the critic's taps (tap layer ->
+    # target column via AR_LAYER_TO_TARGET_COL). Independent of the AV INPUT (the k av_in slots) —
+    # exactly like evaluate_e2e, so any condition/combo RLs with the right target.
+    tap_cols = [AR_LAYER_TO_TARGET_COL[l] for l in tap_layers]
+    tap_idx = [AR_TARGET_COLUMNS.index(tc) for tc in tap_cols]
+    tap_names = [AR_TARGET_COL_TO_NAME[tc] for tc in tap_cols]
+    print(f"[rl] AR reconstructs {tap_names} (= layers {list(tap_layers)}) from k={k} av_in input")
 
-    rows = load_rl_dataset_multi(args.rl_parquet, n_max=args.max_rows)
-    # predict-mean FVE baselines over the TARGET slots only (so fve/overall matches the reward)
+    rows, k2 = load_rl_dataset_multi(args.rl_parquet, n_max=args.max_rows)
+    assert k2 == k, f"detected k={k} for the hook but the loader returned k={k2}"
+    for r in rows:
+        r["gold"] = r["gold"][tap_idx]     # [n_tap, d] fixed target aligned to the AR's taps
+    # predict-mean FVE baselines over the TARGET taps only (so fve/overall matches the reward)
     baselines = []
-    for j in target_slot_idx:
-        acts = torch.tensor(np.stack([r["acts"][j] for r in rows[:4000]]), dtype=torch.float32)
-        _, rawvar = compute_predict_mean_baselines(acts, mse_scale)
+    for j in range(len(tap_idx)):
+        g = torch.tensor(np.stack([r["gold"][j] for r in rows[:4000]]), dtype=torch.float32)
+        _, rawvar = compute_predict_mean_baselines(g, mse_scale)
         baselines.append(rawvar)
     print(f"[rl] {len(rows)} rows; per-target baselines " +
-          ", ".join(f"{SLOT_NAMES[j]}={b:.4f}" for j, b in zip(target_slot_idx, baselines)))
+          ", ".join(f"{nm}={b:.4f}" for nm, b in zip(tap_names, baselines)))
+
+    # held-out GREEDY eval set (the 'real' FVE — the training log is SAMPLED, ~10pp lower).
+    eval_rows, eval_baselines = None, None
+    if args.eval_parquet:
+        eval_rows, eval_k = load_rl_dataset_multi(args.eval_parquet, n_max=args.eval_rows)
+        assert eval_k == k, f"eval parquet has k={eval_k} av_in slots but train has k={k}"
+        for r in eval_rows:
+            r["gold"] = r["gold"][tap_idx]
+        eval_baselines = []
+        for j in range(len(tap_idx)):  # predict-the-mean baselines from the EVAL split's targets only
+            g = torch.tensor(np.stack([r["gold"][j] for r in eval_rows]), dtype=torch.float32)
+            _, rv = compute_predict_mean_baselines(g, mse_scale)
+            eval_baselines.append(rv)
+        print(f"[rl] greedy held-out eval: {len(eval_rows)} rows from {Path(args.eval_parquet).name}, "
+              f"every {args.eval_every} steps (metrics logged as eval/*)")
 
     try:
         import bitsandbytes as bnb
@@ -420,8 +520,13 @@ def main():
     rng.shuffle(order)
     cursor = 0
 
-    from multilayer_nla.datasets import INJECT_PLACEHOLDER  # noqa: F401 (sanity that import path is live)
     from nla.schema import extract_explanation
+    from multilayer_nla.datasets import load_stored_prompt
+    # Prefer the rl parquet's STORED prompt (permutation-grid conditions carry the
+    # neutral template); fall back to the legacy k-keyed template for sweep parquets.
+    stored_msgs = load_stored_prompt(args.rl_parquet)
+    prompt_text = build_prompt_text(k, inject_char, tokenizer, prompt_msgs=stored_msgs)
+    print(f"[rl] rollout prompt: {'stored-in-parquet' if stored_msgs else f'legacy build_av_prompt({k})'}")
 
     for step in range(args.num_steps):
         t0 = time.time()
@@ -434,14 +539,13 @@ def main():
         full_ids, plens, acts_l, expls, texts, groups, old_lps, golds = [], [], [], [], [], [], [], []
         for gi, ri in enumerate(batch):
             row = rows[ri]
-            ptext = build_prompt_text(row["prompt"], inject_char, tokenizer)
-            resp = rollout_multislot(actor, tokenizer, ptext, row["acts"], vectors_ref, inj_id,
+            resp = rollout_multislot(actor, tokenizer, prompt_text, row["acts"], vectors_ref, inj_id,
                                      args.group_size, args.max_new_tokens, args.temperature, device, eos_ids)
             for r in resp:
                 full_ids.append(r["full_ids"]); plens.append(r["prompt_len"]); acts_l.append(row["acts"])
                 expls.append(extract_explanation(r["text"])); texts.append(r["text"])
                 groups.append(gi); old_lps.append(r["old_logp"].to(device))
-                golds.append(row["acts"][target_slot_idx])  # AR target = selected slots (injection stays 3-slot)
+                golds.append(row["gold"])  # AR target = fixed prev/centre/next (sliced to taps); input = k av_in
 
         rewards = score_with_multitap_critic(critic, tokenizer, expls, golds, mse_scale, device)
         valid = [r for r in rewards if r is not None]
@@ -477,6 +581,19 @@ def main():
         if texts:  # show a sample rollout so extraction failures / CJK are visible
             _s0 = texts[0][:200].replace("\n", " ")
             print(f"    [sample extracted={expls[0] is not None}] {_s0!r}", flush=True)
+
+        # periodic GREEDY held-out eval — the number to actually watch (train FVE above is SAMPLED).
+        if eval_rows is not None and (step % args.eval_every == 0 or (step + 1) == args.num_steps):
+            ev = greedy_eval(actor, tokenizer, critic, eval_rows, eval_baselines,
+                             mse_scale, inject_char, vectors_ref, eos_ids, device,
+                             max_new_tokens=args.max_new_tokens, prompt_text=prompt_text)
+            log["eval/fve_greedy"] = ev["fve_greedy"]
+            log["eval/pen_fve_greedy"] = ev["pen_fve_greedy"]
+            log["eval/extraction_rate"] = ev["extraction_rate"]
+            print(f"    [GREEDY held-out] FVE {ev['fve_greedy']*100:.1f}% "
+                  f"(pen {ev['pen_fve_greedy']*100:.1f}%) | ext {ev['extraction_rate']:.0%} "
+                  f"| n={ev['n']}  <- the real number; sampled FVE above runs ~10pp lower", flush=True)
+
         if not args.no_wandb:
             import wandb
             wandb.log(log, step=step)
