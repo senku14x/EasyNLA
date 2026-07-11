@@ -314,6 +314,32 @@ differ); dev selects checkpoints, test is touched once. Decision rules
 - `lay3 − dup3` should reproduce §7's +1.6pp under the neutral template
   (a recipe sanity anchor, not a new claim).
 
+## Layer grid (free — uses the full stored L19-29 band)
+
+`--conditions-preset layer_grid`: every slot is at position p (offset 0), so it
+needs only `activation_L{k}` (no windows) and any layer in the 11-layer bank is
+fair game. All conditions reconstruct the SAME fixed [L23,L24,L25]@p target;
+only the AV **input layers** vary. This is the §7/§8 layer question at full
+resolution:
+
+| condition | input layers @p | tests |
+|---|---|---|
+| `single` / `dup2` / `dup3` / `dup5` | L24 ×{1,2,3,5} | marker-count controls |
+| `lay2` / `lay3` | 23,25 / 23,24,25 | adjacent to target |
+| `far2` | 19, 29 | the two extremes (max decorrelation, k=2) |
+| `wide` | 20, 24, 28 | wide span (k=3) — §7 `wide` |
+| `s2lo` / `s2hi` | 19,21,23 / 20,22,24 | stride-2 (k=3) — §7 stride |
+| `band5` / `spread5` | 21-25 / 19,22,24,26,29 | adjacency vs span (k=5) |
+
+Head-to-heads (paired doc-bootstrap, matched k): `wide`/`s2hi` − `lay3`
+(does span beat adjacency, as §7 found?); `band5` − `spread5` (same at k=5);
+`single→lay3→band5` each vs its dup (does depth keep paying, or plateau by
+k=2-with-L24 as §8 saw?); `far2` − `lay2` (extremes vs adjacent pair).
+
+Changing the reconstruction **target** center (not input) is the one thing the
+bank does NOT make free — the shared AR is fixed to reconstruct L23/24/25, so a
+target sweep needs a retrained AR (`AR_LAYER_TO_TARGET_COL` + `--tap-layers`).
+
 ## Warmstart improvement (the actual bottleneck)
 
 SFT imitates gold, and the gold ceiling is what caps the warm start. Two

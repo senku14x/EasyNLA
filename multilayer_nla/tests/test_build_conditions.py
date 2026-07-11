@@ -111,6 +111,18 @@ def test_parse_condition_grammar():
     assert {"single", "dup3", "lay3", "tok3", "mix4", "dup4", "tok3_shufctx"} <= set(grid)
 
 
+def test_layer_grid_needs_only_final_token_layers():
+    # every LAYER_GRID slot is at offset 0 -> validates against a WINDOWLESS bank
+    # (activation_L19..29 only), and only touches layers in the stored band.
+    from multilayer_nla.conditions import LAYER_GRID
+    grid = parse_conditions(LAYER_GRID)
+    for c, v in grid.items():
+        assert all(off == 0 for _, off in v.slots), f"{c}: layer grid must be all @0"
+        validate_against_bank(v, activation_layers=set(range(19, 30)),
+                              window_layers=set(), window_size=0)   # no windows needed
+        assert all(19 <= L <= 29 for L in v.layers), f"{c}: layer outside stored band"
+
+
 def test_validate_against_bank_errors():
     kw = dict(activation_layers={23, 24, 25}, window_layers={24}, window_size=4)
     validate_against_bank(parse_condition("ok=L24@-3,L24@0"), **kw)

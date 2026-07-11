@@ -179,3 +179,33 @@ PERMUTATION_GRID = (
     "tok5_shufctx=L24@-4,L24@-3,L24@-2,L24@-1,L24@0|shufctx; "
     "tok5w_shufctx=L24@-7,L24@-4,L24@-2,L24@-1,L24@0|shufctx"
 )
+
+# LAYER grid — exploits the full stored L19-29 band, ALL slots at position p
+# (offset 0), so it needs only activation_L{k} (no windows). Every condition
+# reconstructs the SAME fixed target (default [L23,L24,L25]@p); the input layers
+# vary. Matched-k with dup controls; the head-to-heads mirror §7/§8:
+#   * adjacency vs span at k=3: lay3 (adjacent 23-25) vs wide (20/24/28) vs
+#     s2lo/s2hi (stride-2). §7 found span/stride beats adjacency at fixed k.
+#   * saturation: single -> lay3 -> band5 (contiguous 5) each vs its dup control
+#     — does more layers keep paying, or plateau (§8 said ~k=2-with-L24)?
+#   * adjacency vs span at k=5: band5 (contiguous 21-25) vs spread5 (19..29
+#     across the whole band).
+#   * far2 (the extremes L19,L29) — do two maximally-separated layers beat the
+#     adjacent pair lay2? decorrelation in the extreme.
+# NB reconstructing a DIFFERENT target center is NOT here — that needs a
+# retrained AR (AR_LAYER_TO_TARGET_COL is fixed to 23/24/25). This sweeps the
+# INPUT only, which is free from the bank.
+LAYER_GRID = (
+    "single=L24@0; "
+    "lay2=L23@0,L25@0; "
+    "far2=L19@0,L29@0; "
+    "dup2=L24@0,L24@0; "
+    "dup3=L24@0,L24@0,L24@0; "
+    "lay3=L23@0,L24@0,L25@0; "
+    "wide=L20@0,L24@0,L28@0; "
+    "s2lo=L19@0,L21@0,L23@0; "
+    "s2hi=L20@0,L22@0,L24@0; "
+    "dup5=L24@0,L24@0,L24@0,L24@0,L24@0; "
+    "band5=L21@0,L22@0,L23@0,L24@0,L25@0; "
+    "spread5=L19@0,L22@0,L24@0,L26@0,L29@0"
+)

@@ -601,8 +601,9 @@ def main():
     p.add_argument("--conditions", help="';'-joined condition specs, e.g. "
                                         "'single=L24@0; tok3=L24@-2,L24@-1,L24@0' "
                                         "(see conditions.py; PERMUTATION_GRID is the pre-registered set)")
-    p.add_argument("--conditions-preset", choices=["permutation_grid", "legacy_sweep"],
-                   help="named preset instead of --conditions")
+    p.add_argument("--conditions-preset", choices=["permutation_grid", "layer_grid", "legacy_sweep"],
+                   help="named preset instead of --conditions (permutation_grid = positions x layers; "
+                        "layer_grid = full L19-29 layer sweep at p; legacy_sweep = the §7 conditions)")
     p.add_argument("--in", dest="inp", help="bank shard glob (single-mode)")
     p.add_argument("--in-dir", help="bank dir with av_sft/ar_sft/rl parquets or shards (--mode all)")
     p.add_argument("--out", help="output parquet (single-mode)")
@@ -628,9 +629,12 @@ def main():
 
     if args.conditions_preset:
         assert not args.conditions, "pass --conditions or --conditions-preset, not both"
-        from multilayer_nla.conditions import LEGACY_SWEEP, PERMUTATION_GRID
-        args.conditions = (PERMUTATION_GRID if args.conditions_preset == "permutation_grid"
-                           else "; ".join(LEGACY_SWEEP.values()))
+        from multilayer_nla.conditions import LAYER_GRID, LEGACY_SWEEP, PERMUTATION_GRID
+        args.conditions = {
+            "permutation_grid": PERMUTATION_GRID,
+            "layer_grid": LAYER_GRID,
+            "legacy_sweep": "; ".join(LEGACY_SWEEP.values()),
+        }[args.conditions_preset]
     conds = parse_conditions(args.conditions) if args.conditions else None
 
     def _layers(s):
