@@ -38,7 +38,7 @@ dependencies = [
 Homepage = "https://github.com/asherps/EasyNLA"
 
 [tool.setuptools.packages.find]
-include = ["nla*"]
+include = ["nla*", "multilayer_nla*"]
 
 [tool.setuptools.package-data]
 nla = ["datagen/*.yaml"]
